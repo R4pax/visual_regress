@@ -1,18 +1,31 @@
+#!/usr/bin/env python3
+"""
+Visual regression checker.
+
+Сравнивает скриншоты эталонного сайта и сайта с изменениями
+в нескольких viewport-ах. Поддерживает мокирование бэкенд-запросов
+и генерирует HTML-отчёт с расхождениями.
+"""
+
 import asyncio
-import json
 import sys
 import datetime as dt
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit, urljoin
 
 import yaml
 from PIL import Image, ImageChops, ImageDraw
-from pixelmatch import pixelmatch
-from playwright.async_api import async_playwright, Page, BrowserContext, Route
 from jinja2 import Template
+from playwright.async_api import (
+    async_playwright,
+    BrowserContext,
+    Page,
+    Route,
+)
 
 
-# ---------- утилиты ----------
+# ---------------------------------------------------------------- utilities
 
 def load_config(path: str = "config.yaml") -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -20,21 +33,43 @@ def load_config(path: str = "config.yaml") -> dict:
 
 
 def url_join(base: str, rel: str) -> str:
-    return base.rstrip("/") + "/" + rel.lstrip("/")
+    """
+    Корректно склеивает базовый URL (возможно, с query string)
+    и относительный путь.
+
+    url_join("https://x.ru/?token=abc", "/gigachat/")
+        -> "https://x.ru/gigachat/?token=abc"
+    url_join("https://x.ru/", "catalog")
+        -> "https://x.ru/catalog"
+    """
+    if rel.startswith(("http://", "https://")):
+        return rel
+
+    parts = urlsplit(base)
+    new_path = urljoin(parts.path or "/", rel.lstrip("/"))
+    return urlunsplit((
+        parts.scheme,
+        parts.netloc,
+        new_path,
+        parts.query,
+        parts.fragment,
+    ))
 
 
 def slug(rel: str) -> str:
-    s = rel.strip("/").replace("/", "_")
+    s = rel.strip("/").replace("/", "_").replace("?", "_").replace("=", "_")
     return s or "root"
 
 
 def diff_images(ref_path: Path, cur_path: Path, out_path: Path) -> float:
-    """Возвращает долю различающихся пикселей 0..1 и сохраняет маску diff."""
+    """
+    Считает долю различающихся пикселей (0..1).
+    Сохраняет карту различий в out_path (красные точки поверх current).
+    """
     a = Image.open(ref_path).convert("RGB")
     b = Image.open(cur_path).convert("RGB")
 
     if a.size != b.size:
-        # разные размеры — фиксируем максимум расхождения
         w = max(a.width, b.width)
         h = max(a.height, b.height)
         canvas_a = Image.new("RGB", (w, h), "white")
@@ -44,49 +79,55 @@ def diff_images(ref_path: Path, cur_path: Path, out_path: Path) -> float:
         a, b = canvas_a, canvas_b
 
     w, h = a.size
-    diff_img = Image.new("RGBA", (w, h))
-    diff_pixels = pixelmatch(
-        a.tobytes(), b.tobytes(), diff_img.tobytes(),  # placeholder, перезапишем ниже
-        w, h, threshold=0.1,
-    ) if False else None  # (pixelmatch python-обёртка требует буферы)
-
-    # Работаем через PIL напрямую — стабильнее и без C-зависимостей
-    diff = ImageChops.difference(a, b)
-    bbox = diff.getbbox()
     total = w * h
 
-    if bbox is None:
-        diff_img = Image.new("RGB", (w, h), "white")
-        diff_img.save(out_path)
+    diff = ImageChops.difference(a, b)
+    if diff.getbbox() is None:
+        Image.new("RGB", (w, h), "white").save(out_path)
         return 0.0
 
-    # считаем пиксели, где разница заметна
     gray = diff.convert("L")
     hist = gray.histogram()
-    changed = sum(hist[10:])  # пиксели с разницей >10
-    ratio = changed / total
+    # пиксели с разницей яркости > 10 — считаем «изменившимися»
+    changed = sum(hist[10:])
+    ratio = changed / total if total else 0.0
 
-    # строим картинку-маску поверх current
+    # карта различий: current + красные точки там, где diff > 25
     overlay = b.copy()
     draw = ImageDraw.Draw(overlay)
     px = gray.load()
-    step = 1
-    for y in range(0, h, step):
-        for x in range(0, w, step):
+    for y in range(h):
+        for x in range(w):
             if px[x, y] > 25:
                 draw.point((x, y), fill=(255, 0, 0))
     overlay.save(out_path)
+
     return ratio
 
 
+# ------------------------------------------------------------------- mocks
+
 async def apply_mocks(context: BrowserContext, mocks: dict[str, str]) -> None:
+    """
+    Перехватывает запросы, попадающие под паттерны, и отдаёт
+    заготовленные JSON-файлы.
+
+    Playwright вызывает route-handler как handler(route, request),
+    поэтому file_path замыкаем через фабрику.
+    """
     def make_handler(file_path: str):
         async def handler(route: Route, request=None) -> None:
             try:
                 body = Path(file_path).read_text(encoding="utf-8")
             except FileNotFoundError:
+                print(f"  ! mock file not found: {file_path}", file=sys.stderr)
                 await route.continue_()
                 return
+            except Exception as e:
+                print(f"  ! mock error ({file_path}): {e}", file=sys.stderr)
+                await route.continue_()
+                return
+
             await route.fulfill(
                 status=200,
                 content_type="application/json",
@@ -98,22 +139,37 @@ async def apply_mocks(context: BrowserContext, mocks: dict[str, str]) -> None:
         await context.route(pattern, make_handler(file_path))
 
 
-async def hide_dynamic(page: Page, selectors: list[str], disable_animations: bool):
+# ---------------------------------------------------------------- rendering
+
+async def hide_dynamic(
+    page: Page,
+    selectors: list[str],
+    disable_animations: bool,
+) -> None:
     if disable_animations:
-        await page.add_style_tag(content="""
-            *, *::before, *::after {
-                animation-duration: 0s !important;
-                animation-delay: 0s !important;
-                transition-duration: 0s !important;
-                transition-delay: 0s !important;
-                caret-color: transparent !important;
-            }
-        """)
+        try:
+            await page.add_style_tag(content="""
+                *, *::before, *::after {
+                    animation-duration: 0s !important;
+                    animation-delay: 0s !important;
+                    transition-duration: 0s !important;
+                    transition-delay: 0s !important;
+                    caret-color: transparent !important;
+                }
+            """)
+        except Exception as e:
+            print(f"  ! add_style_tag failed: {e}", file=sys.stderr)
+
     for sel in selectors:
-        await page.evaluate(
-            """(sel) => document.querySelectorAll(sel).forEach(el => el.remove())""",
-            sel,
-        )
+        try:
+            await page.evaluate(
+                """(sel) => document.querySelectorAll(sel).forEach(el => {
+                    el.style.visibility = 'hidden';
+                })""",
+                sel,
+            )
+        except Exception as e:
+            print(f"  ! hide_dynamic({sel}) failed: {e}", file=sys.stderr)
 
 
 async def take_screenshot(
@@ -131,49 +187,59 @@ async def take_screenshot(
         context = await browser.new_context(
             viewport={"width": viewport["width"], "height": viewport["height"]},
             device_scale_factor=1,
+            ignore_https_errors=True,
             user_agent=(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124 Safari/537.36"
             ),
         )
         await apply_mocks(context, mocks)
+
         page = await context.new_page()
+        target = url_join(base_url, rel_url)
+
         try:
-            await page.goto(url_join(base_url, rel_url),
-                            wait_until="networkidle", timeout=60_000)
+            await page.goto(target, wait_until="load", timeout=60_000)
         except Exception as e:
-            print(f"  ! timeout/error loading {rel_url}: {e}", file=sys.stderr)
-            try:
-                await page.wait_for_load_state("domcontentloaded", timeout=5000)
-            except Exception:
-                pass
+            print(f"  ! goto failed {target}: {e}", file=sys.stderr)
+
+        # добить «хвост» запросов (аналитика, отложенные запросы),
+        # но не падать, если что-то висит
+        try:
+            await page.wait_for_load_state("networkidle", timeout=10_000)
+        except Exception:
+            pass
 
         await hide_dynamic(page, mask_selectors, disable_animations)
         await page.wait_for_timeout(settle_ms)
 
-        # прокрутка до низа — триггерим lazy-load
-        await page.evaluate("""async () => {
-            await new Promise(res => {
-                let y = 0;
-                const step = 400;
-                const t = setInterval(() => {
-                    window.scrollTo(0, y);
-                    y += step;
-                    if (y >= document.body.scrollHeight) {
-                        clearInterval(t);
-                        window.scrollTo(0, 0);
-                        res();
-                    }
-                }, 80);
-            });
-        }""")
+        # прокрутка до низа и обратно — триггерит lazy-load
+        try:
+            await page.evaluate("""async () => {
+                await new Promise(res => {
+                    let y = 0;
+                    const step = 400;
+                    const t = setInterval(() => {
+                        window.scrollTo(0, y);
+                        y += step;
+                        if (y >= document.body.scrollHeight) {
+                            clearInterval(t);
+                            window.scrollTo(0, 0);
+                            res();
+                        }
+                    }, 80);
+                });
+            }""")
+        except Exception as e:
+            print(f"  ! scroll failed: {e}", file=sys.stderr)
+
         await page.wait_for_timeout(500)
 
         await page.screenshot(path=str(out_path), full_page=True)
         await browser.close()
 
 
-# ---------- основной прогон ----------
+# --------------------------------------------------------------- main loop
 
 async def check_one(
     rel_url: str,
@@ -188,6 +254,7 @@ async def check_one(
     diff_png = outdir / f"{name}__{vp_name}__diff.png"
 
     print(f"→ [{vp_name}] {rel_url}")
+
     await take_screenshot(
         cfg["reference"], rel_url, viewport, ref_png,
         cfg.get("mocks", {}), cfg["settle_ms"],
@@ -201,7 +268,7 @@ async def check_one(
 
     ratio = diff_images(ref_png, cur_png, diff_png)
     status = "ok" if ratio <= cfg["diff_threshold"] else "diff"
-    print(f"   {'✓' if status=='ok' else '✗'} diff={ratio:.4%}")
+    print(f"   {'✓' if status == 'ok' else '✗'} diff={ratio:.4%}")
 
     return {
         "url": rel_url,
@@ -219,27 +286,33 @@ REPORT_TEMPLATE = """
 <html lang="ru"><head><meta charset="utf-8">
 <title>Visual diff report — {{ ts }}</title>
 <style>
-  body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;background:#fafafa;color:#222}
+  body{font-family:-apple-system,Segoe UI,Roboto,sans-serif;margin:24px;
+       background:#fafafa;color:#222}
   h1{margin:0 0 4px}
   .meta{color:#666;margin-bottom:24px}
-  table{border-collapse:collapse;width:100%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.08)}
-  th,td{padding:10px 12px;border-bottom:1px solid #eee;text-align:left;vertical-align:top}
+  table{border-collapse:collapse;width:100%;background:#fff;
+        box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  th,td{padding:10px 12px;border-bottom:1px solid #eee;text-align:left;
+        vertical-align:top}
   th{background:#f4f4f4;font-weight:600}
   .ok{color:#197d29;font-weight:600}
   .diff{color:#c9261c;font-weight:600}
   .pair{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
   .pair figure{margin:0}
-  .pair img{max-width:100%;border:1px solid #ddd;border-radius:4px;background:#fff}
+  .pair img{max-width:100%;border:1px solid #ddd;border-radius:4px;
+            background:#fff}
   figcaption{font-size:12px;color:#666;margin-top:4px}
   details summary{cursor:pointer;color:#0563c1}
 </style></head>
 <body>
   <h1>Отчёт визуальной регрессии</h1>
   <div class="meta">Сформирован: {{ ts }} · Порог: {{ threshold_pct }}% ·
-     Всего проверок: {{ results|length }} · Расхождений: {{ broken }}</div>
+     Всего проверок: {{ results|length }} ·
+     Расхождений: {{ broken }}</div>
 
   <table>
-    <tr><th>URL</th><th>Viewport</th><th>Diff %</th><th>Статус</th><th>Детали</th></tr>
+    <tr><th>URL</th><th>Viewport</th><th>Diff %</th><th>Статус</th>
+        <th>Детали</th></tr>
     {% for r in results %}
     <tr>
       <td>{{ r.url }}</td>
@@ -270,21 +343,30 @@ async def main(cfg_path: str = "config.yaml") -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     results: list[dict[str, Any]] = []
+
     for rel_url in cfg["urls"]:
         for vp_name, vp in cfg["viewports"].items():
             try:
-                results.append(await check_one(rel_url, vp_name, vp, cfg, outdir))
+                results.append(
+                    await check_one(rel_url, vp_name, vp, cfg, outdir)
+                )
             except Exception as e:
-                print(f"   ! FAILED {rel_url} [{vp_name}]: {e}", file=sys.stderr)
+                print(f"   ! FAILED {rel_url} [{vp_name}]: {e}",
+                      file=sys.stderr)
                 results.append({
-                    "url": rel_url, "viewport": vp_name,
-                    "diff_ratio": 1.0, "status": "diff",
-                    "ref": "", "cur": "", "diff": "",
+                    "url": rel_url,
+                    "viewport": vp_name,
+                    "diff_ratio": 1.0,
+                    "status": "diff",
+                    "ref": "",
+                    "cur": "",
+                    "diff": "",
                 })
 
     broken = sum(1 for r in results if r["status"] != "ok")
     html = Template(REPORT_TEMPLATE).render(
-        ts=ts, results=results,
+        ts=ts,
+        results=results,
         threshold_pct=cfg["diff_threshold"] * 100,
         broken=broken,
     )
@@ -297,4 +379,5 @@ async def main(cfg_path: str = "config.yaml") -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main(sys.argv[1] if len(sys.argv) > 1 else "config.yaml")))
+    cfg = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
+    sys.exit(asyncio.run(main(cfg)))
