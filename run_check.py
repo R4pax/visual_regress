@@ -374,7 +374,7 @@ REPORT_TEMPLATE = """
   th{background:#f4f4f4;font-weight:600}
   .ok{color:#197d29;font-weight:600}
   .diff{color:#c9261c;font-weight:600}
-  .pair{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+  .pair{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;position:absolute;left:0;padding:24px;background:#333;z-index:1;}
   .pair figure{margin:0}
   .pair img{max-width:100%;border:1px solid #ddd;border-radius:4px;
             background:#fff}
