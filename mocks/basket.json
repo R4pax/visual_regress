@@ -1,0 +1,22 @@
+{
+  "layout_info": {
+    "title": "Корзина",
+    "h1": "Корзина"
+  },
+  "data": {
+    "user": {
+      "auth": "N",
+      "redirect_sberid": true
+    },
+    "basket": {
+      "items": [],
+      "basket_quantity": 0,
+      "basket_disc_sum": 0,
+      "basket_sum": 0,
+      "discount_sum": 0
+    },
+    "errors": [],
+    "coupon": "",
+    "coupon_error": ""
+  }
+}

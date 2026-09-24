@@ -1,0 +1,47 @@
+reference: "https://sberdevices.ru/"
+current: "https://sberdevices.ru/"
+
+urls:
+  - "/"
+  - "/gigachat/"
+
+viewports:
+  desktop: { width: 1440, height: 900 }
+  mobile: { width: 360, height: 800 }
+
+# Порог различий (0..1). 0.001 = 0.1% пикселей
+diff_threshold: 0.002
+
+# Задержка перед скриншотом (анимации, шрифты, отложенные блоки)
+settle_ms: 1500
+
+# Отключать анимации перед снимком
+disable_animations: true
+
+# Селекторы, которые вырезаем из DOM перед снимком (динамика)
+mask_selectors:
+  - ".js-current-time"
+  - "[data-dynamic-timestamp]"
+
+# Мок-эндпоинты: сопоставление с файлами в mocks/
+mocks:
+  "**/api/bx/v1/ecom/basket/page.php": "mocks/basket.json"
+  "**/api/bx/v1/ecom/lk/page.php": "mocks/lk.json"
+
+# /gigachat/
+# /os/
+# /sberboom/
+# /sberboom-home/
+# /sberboom-micro/
+# /sberboom-mini/
+# /sberboom-mini-prostokvashino/
+# /sberboom-mini2/
+# /sberbox2/
+# /sberkot/
+# /smarthome/atlasdesignsmart
+# /smarthome/climate
+# /smarthome/
+# /smarthome/lighting
+# /smarthome/security
+# /smarthome/zigbee
+# /sberboom-home-love/

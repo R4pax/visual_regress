@@ -1,0 +1,27 @@
+{
+  "data": {
+    "user": {
+      "auth": "N",
+      "redirect_sberid": false,
+      "auth_link": "https://id-sb.sber.ru"
+    },
+    "loyalty_agreement": {
+      "sberspasibo": {
+        "link": "https://spasibosberbank.ru/how-it-works?tab=with_card",
+        "version": ""
+      },
+      "loyalty": {
+        "link": "https://www.sberbank.ru/common/img/spasibo/docs/loyalty/rules_010526.pdf",
+        "version": "RA0041"
+      },
+      "personal_data": {
+        "link": "https://www.sberbank.ru/common/img/spasibo/docs/opd_0625.pdf",
+        "version": "D0003"
+      },
+      "news": {
+        "link": "https://www.sberbank.ru/common/img/spasibo/docs/pravila_programmi_e_mail_tel_.pdf",
+        "version": "ANA0002"
+      }
+    }
+  }
+}
