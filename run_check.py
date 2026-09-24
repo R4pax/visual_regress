@@ -25,6 +25,98 @@ from playwright.async_api import (
 )
 
 
+# ---------------------------------------------------------------- constants
+
+# CSS-заморозка. Применяется многократно (до и после прокрутки).
+FREEZE_CSS = """
+*, *::before, *::after {
+    animation-duration: 0s !important;
+    animation-delay: 0s !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0s !important;
+    transition-delay: 0s !important;
+    caret-color: transparent !important;
+    scroll-behavior: auto !important;
+}
+
+/* видео и аудио полностью скрываем — poster-кадр не детерминирован */
+video, audio {
+    visibility: hidden !important;
+}
+
+/* анимированные GIF/APNG — скрываем, они не подчиняются CSS */
+img[src$=".gif"], img[src*=".gif?"],
+img[src$=".apng"], img[src*=".apng?"] {
+    visibility: hidden !important;
+}
+
+/* SMIL-анимации SVG */
+svg animate, svg animateTransform, svg animateMotion {
+    display: none !important;
+}
+"""
+
+# JS-заморозка: пауза video, Web Animations API и остановка rAF.
+# Вызывается дважды — до и после прокрутки.
+FREEZE_JS = """
+() => {
+    // 1. Все <video> — на паузу, сброс на первый кадр
+    document.querySelectorAll('video').forEach(v => {
+        try {
+            v.pause();
+            v.removeAttribute('autoplay');
+            v.currentTime = 0;
+        } catch (e) {}
+    });
+
+    // 2. Web Animations API — пауза (ловит element.animate, включая Lottie)
+    if (document.getAnimations) {
+        document.getAnimations().forEach(a => {
+            try { a.pause(); a.currentTime = 0; } catch (e) {}
+        });
+    }
+}
+"""
+
+# Финальная заморозка — прямо перед скриншотом. Дополнительно глушит rAF.
+FINAL_FREEZE_JS = """
+() => {
+    document.querySelectorAll('video').forEach(v => {
+        try { v.pause(); } catch (e) {}
+    });
+    if (document.getAnimations) {
+        document.getAnimations().forEach(a => {
+            try { a.pause(); a.currentTime = 0; } catch (e) {}
+        });
+    }
+    // после этого rAF больше не планирует новые кадры
+    // (текущий кадр завершится, дальше тишина)
+    window.requestAnimationFrame = function (cb) {
+        try { cb(performance.now()); } catch (e) {}
+        return 0;
+    };
+}
+"""
+
+SCROLL_JS = """
+async () => {
+    await new Promise(res => {
+        let y = 0;
+        const step = 400;
+        const t = setInterval(() => {
+            window.scrollTo(0, y);
+            y += step;
+            if (y >= document.body.scrollHeight) {
+                clearInterval(t);
+                window.scrollTo(0, 0);
+                res();
+            }
+        }, 80);
+    });
+}
+"""
+
+
 # ---------------------------------------------------------------- utilities
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -36,11 +128,6 @@ def url_join(base: str, rel: str) -> str:
     """
     Корректно склеивает базовый URL (возможно, с query string)
     и относительный путь.
-
-    url_join("https://x.ru/?token=abc", "/gigachat/")
-        -> "https://x.ru/gigachat/?token=abc"
-    url_join("https://x.ru/", "catalog")
-        -> "https://x.ru/catalog"
     """
     if rel.startswith(("http://", "https://")):
         return rel
@@ -62,10 +149,6 @@ def slug(rel: str) -> str:
 
 
 def diff_images(ref_path: Path, cur_path: Path, out_path: Path) -> float:
-    """
-    Считает долю различающихся пикселей (0..1).
-    Сохраняет карту различий в out_path (красные точки поверх current).
-    """
     a = Image.open(ref_path).convert("RGB")
     b = Image.open(cur_path).convert("RGB")
 
@@ -88,11 +171,9 @@ def diff_images(ref_path: Path, cur_path: Path, out_path: Path) -> float:
 
     gray = diff.convert("L")
     hist = gray.histogram()
-    # пиксели с разницей яркости > 10 — считаем «изменившимися»
     changed = sum(hist[10:])
     ratio = changed / total if total else 0.0
 
-    # карта различий: current + красные точки там, где diff > 25
     overlay = b.copy()
     draw = ImageDraw.Draw(overlay)
     px = gray.load()
@@ -108,13 +189,6 @@ def diff_images(ref_path: Path, cur_path: Path, out_path: Path) -> float:
 # ------------------------------------------------------------------- mocks
 
 async def apply_mocks(context: BrowserContext, mocks: dict[str, str]) -> None:
-    """
-    Перехватывает запросы, попадающие под паттерны, и отдаёт
-    заготовленные JSON-файлы.
-
-    Playwright вызывает route-handler как handler(route, request),
-    поэтому file_path замыкаем через фабрику.
-    """
     def make_handler(file_path: str):
         async def handler(route: Route, request=None) -> None:
             try:
@@ -139,28 +213,33 @@ async def apply_mocks(context: BrowserContext, mocks: dict[str, str]) -> None:
         await context.route(pattern, make_handler(file_path))
 
 
-# ---------------------------------------------------------------- rendering
+# ---------------------------------------------------------------- freezing
 
-async def hide_dynamic(
+async def freeze_page(
     page: Page,
-    selectors: list[str],
+    mask_selectors: list[str],
     disable_animations: bool,
 ) -> None:
+    """
+    Многоуровневая заморозка страницы:
+      1. CSS — обнуляет CSS-анимации и transition
+      2. JS  — пауза <video> и Web Animations API
+      3. маски — прячет элементы по селекторам
+
+    Можно вызывать многократно (после прокрутки — обязательно).
+    """
     if disable_animations:
         try:
-            await page.add_style_tag(content="""
-                *, *::before, *::after {
-                    animation-duration: 0s !important;
-                    animation-delay: 0s !important;
-                    transition-duration: 0s !important;
-                    transition-delay: 0s !important;
-                    caret-color: transparent !important;
-                }
-            """)
+            await page.add_style_tag(content=FREEZE_CSS)
         except Exception as e:
             print(f"  ! add_style_tag failed: {e}", file=sys.stderr)
 
-    for sel in selectors:
+        try:
+            await page.evaluate(FREEZE_JS)
+        except Exception as e:
+            print(f"  ! freeze_js failed: {e}", file=sys.stderr)
+
+    for sel in mask_selectors:
         try:
             await page.evaluate(
                 """(sel) => document.querySelectorAll(sel).forEach(el => {
@@ -171,6 +250,8 @@ async def hide_dynamic(
         except Exception as e:
             print(f"  ! hide_dynamic({sel}) failed: {e}", file=sys.stderr)
 
+
+# ---------------------------------------------------------------- rendering
 
 async def take_screenshot(
     base_url: str,
@@ -203,37 +284,33 @@ async def take_screenshot(
         except Exception as e:
             print(f"  ! goto failed {target}: {e}", file=sys.stderr)
 
-        # добить «хвост» запросов (аналитика, отложенные запросы),
-        # но не падать, если что-то висит
         try:
             await page.wait_for_load_state("networkidle", timeout=10_000)
         except Exception:
             pass
 
-        await hide_dynamic(page, mask_selectors, disable_animations)
+        # первая заморозка — до прокрутки
+        await freeze_page(page, mask_selectors, disable_animations)
         await page.wait_for_timeout(settle_ms)
 
-        # прокрутка до низа и обратно — триггерит lazy-load
+        # прокрутка для lazy-load
         try:
-            await page.evaluate("""async () => {
-                await new Promise(res => {
-                    let y = 0;
-                    const step = 400;
-                    const t = setInterval(() => {
-                        window.scrollTo(0, y);
-                        y += step;
-                        if (y >= document.body.scrollHeight) {
-                            clearInterval(t);
-                            window.scrollTo(0, 0);
-                            res();
-                        }
-                    }, 80);
-                });
-            }""")
+            await page.evaluate(SCROLL_JS)
         except Exception as e:
             print(f"  ! scroll failed: {e}", file=sys.stderr)
 
-        await page.wait_for_timeout(500)
+        # вторая заморозка — scroll мог оживить анимации
+        await freeze_page(page, mask_selectors, disable_animations)
+
+        # финальный «стоп-кран»: пауза всех анимаций и остановка rAF
+        if disable_animations:
+            try:
+                await page.evaluate(FINAL_FREEZE_JS)
+            except Exception as e:
+                print(f"  ! final_freeze failed: {e}", file=sys.stderr)
+
+        # дать текущему кадру завершиться
+        await page.wait_for_timeout(300)
 
         await page.screenshot(path=str(out_path), full_page=True)
         await browser.close()

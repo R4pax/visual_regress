@@ -36,8 +36,9 @@ disable_animations: true
 
 # Селекторы, которые вырезаем из DOM перед снимком (динамика)
 mask_selectors:
-  - ".js-current-time"
-  - "[data-dynamic-timestamp]"
+  - "[data-lottie]"
+  - ".lottie-container"
+  - "svg[aria-label='animated']"
 
 # Мок-эндпоинты: сопоставление с файлами в mocks/
 mocks:
