@@ -2,28 +2,33 @@ reference: "https://sberdevices.ift.app.sberdevices.ru/?pr_auth_proxy_token=ce26
 current: "https://pr-1543-sberdevices.dev.app.sberdevices.ru/?pr_auth_proxy_token=d85addd0ecdd393fa2b42ad66e3b3b58"
 
 urls:
+  - "/"
+  - "/farfield/"
+  - "/gigachat/"
+  - "/os/"
+  - "/ring/"
+  - "/sberboom/"
+  - "/sberboom-2/"
+  - "/sberboom-home/"
+  - "/sberboom-home-love/"
+  - "/sberboom-micro/"
+  - "/sberboom-mini/"
+  - "/sberboom-mini-prostokvashino/"
+  - "/sberboom-mini2/"
+  - "/sberbox2/"
+  - "/sberboxmax/"
+  - "/sberboxtop/"
+  - "/sberkot/"
   - "/smarthome/"
+  - "/smarthome/atlasdesignsmart/"
+  - "/smarthome/climate/"
   - "/smarthome/lighting/"
   - "/smarthome/security/"
-
-# - "/"
-# - "/gigachat/"
-# - "/os/"
-# - "/sberboom/"
-# - "/sberboom-home/"
-# - "/sberboom-micro/"
-# - "/sberboom-mini/"
-# - "/sberboom-mini-prostokvashino/"
-# - "/sberboom-mini2/"
-# - "/sberbox2/"
-# - "/sberkot/"
-# - "/smarthome/atlasdesignsmart/"
-# - "/smarthome/climate/"
-# - "/smarthome/"
-# - "/smarthome/lighting/"
-# - "/smarthome/security/"
-# - "/smarthome/zigbee/"
-# - "/sberboom-home-love/"
+  - "/smarthome/zigbee/"
+  - "/smarthotel/"
+  - "/spaceday/"
+  - "/tv8000/"
+  - "/tvsber/"
 
 viewports:
   desktop: { width: 1440, height: 900 }
@@ -33,7 +38,7 @@ viewports:
 diff_threshold: 0.002
 
 # Задержка перед скриншотом (анимации, шрифты, отложенные блоки)
-settle_ms: 1500
+settle_ms: 3000
 
 # Отключать анимации перед снимком
 disable_animations: true
