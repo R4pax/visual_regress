@@ -1,12 +1,26 @@
 reference: "https://sberdevices.ift.app.sberdevices.ru/?pr_auth_proxy_token=ce26d7350a6d2787bdc7e0b0defd1326"
-current: "https://pr-1543-sberdevices.dev.app.sberdevices.ru/?pr_auth_proxy_token=d85addd0ecdd393fa2b42ad66e3b3b58"
+current: "https://pr-1557-sberdevices.dev.app.sberdevices.ru/?pr_auth_proxy_token=6afb833dcb3fe6beed824ac742c8fc21"
 
 urls:
   - "/"
+  - "/about/"
+  - "/about-sberboom-2/"
+  - "/b2b/"
+  - "/b2b/shop/"
+  - "/b2b/smarthome/education/"
+  - "/b2b/smarthome/education/reserve/"
+  - "/claim/"
+  - "/contacts/"
+  - "/event/"
   - "/farfield/"
   - "/gigachat/"
+  - "/greenday/"
+  - "/offline_store/"
   - "/os/"
+  - "/promo/"
   - "/ring/"
+  - "/ring/size/"
+  - "/ring/start/"
   - "/sberboom/"
   - "/sberboom-2/"
   - "/sberboom-home/"
@@ -17,8 +31,10 @@ urls:
   - "/sberboom-mini2/"
   - "/sberbox2/"
   - "/sberboxmax/"
+  - "/sberboxmax_gaming/"
   - "/sberboxtop/"
   - "/sberkot/"
+  - "/shop/"
   - "/smarthome/"
   - "/smarthome/atlasdesignsmart/"
   - "/smarthome/climate/"
@@ -26,23 +42,87 @@ urls:
   - "/smarthome/security/"
   - "/smarthome/zigbee/"
   - "/smarthotel/"
-  - "/spaceday/"
+  - "/special-offers/"
+  - "/survey/"
   - "/tv8000/"
   - "/tvsber/"
 
 viewports:
-  wide: { width: 3440, height: 1200 }
+  wide: { width: 2080, height: 1000 }
   desktop: { width: 1440, height: 900 }
   mobile: { width: 360, height: 800 }
 
 # Порог различий (0..1). 0.001 = 0.1% пикселей
 diff_threshold: 0.002
 
-# Задержка перед скриншотом (анимации, шрифты, отложенные блоки)
-settle_ms: 3000
+# ОСНОВНОЕ ожидание теперь не фиксированное: скрипт дожидается реальной
+# готовности ресурсов (см. wait_for_media ниже). settle_ms — это ДОБАВКА
+# к нему: небольшая пауза на отложенные блоки и пересчёт layout.
+settle_ms: 1500
+
+# ----------------------------------------------------------------------------
+# Ожидание загрузки ресурсов (вместо «спим N секунд и надеемся»)
+# ----------------------------------------------------------------------------
+
+# Ждать, пока картинки загрузятся И раскодируются (img.decode), CSS-фоны
+# подтянутся, а шрифты применятся. Прогревает lazy-load повторной прокруткой
+wait_for_media: true
+
+# Общий бюджет ожидания на одну страницу, мс. 0 — без ограничения
+media_timeout_ms: 180000
+
+# Потолок ожидания на один ресурс, мс (чтобы не зависнуть на битой картинке)
+media_per_resource_ms: 30000
+
+# Догружать CSS-фоны (background-image) — частая причина «полузагруженных»
+# картинок в снимке: элемент уже на месте, а фон ещё едет
+wait_for_backgrounds: true
 
 # Отключать анимации перед снимком
+# (CSS, Web Animations, видео, GIF/APNG — см. FREEZE_CSS/FREEZE_JS)
 disable_animations: true
+
+# ----------------------------------------------------------------------------
+# Заморозка страницы: всё, что может дёрнуть вёрстку после прокрутки
+# ----------------------------------------------------------------------------
+
+# Глушить слушатели «шумных» событий: scroll, wheel, pointer/mouse/touch,
+# keydown, resize, drag. Регистрация перехватывается до скриптов страницы.
+block_event_listeners: true
+
+# Когда взводить глушилку слушателей:
+#   start  — сразу (жёстче; может съесть синтетические события, которыми
+#            сайт пересчитывает layout, напр. window.dispatchEvent(resize))
+#   freeze — перед снимком (а lazy-load по скроллу продолжает работать)
+arm_events: freeze
+
+# Дополнительно снять УЖЕ навешанные слушатели по этим событиям
+# (window/document/html/body, через DevTools getEventListeners)
+strip_event_listeners: true
+
+# Свой список событий (если не задан — берётся DEFAULT_EVENT_TYPES из кода)
+# blocked_events:
+#   - scroll
+#   - wheel
+#   - pointermove
+
+# Гасить IntersectionObserver / ResizeObserver / MutationObserver:
+# живые инстансы disconnect'ятся, новые конструкторы — заглушки
+# (это ломает lazy-load, но lazy-load уже отработал на прокрутке)
+disable_observers: true
+
+# Гасить requestAnimationFrame
+# (колбэк не вызывается — иначе rAF-цикл уйдёт в синхронную рекурсию)
+disable_raf: true
+
+# Гасить setTimeout/setInterval. Агрессивно: некоторые виджеты
+# (балансировщики, autoplay) могут не успеть отрисоваться — включай осознанно
+disable_timers: false
+
+# Перед снимком полностью выключить JS-движок страницы
+# (CDP Emulation.setScriptExecutionDisabled). Максимальная детерминированность;
+# при ошибке скриншота скрипт сам повторит попытку с включённым JS
+kill_scripts_before_shot: true
 
 # Селекторы, которые вырезаем из DOM перед снимком (динамика)
 mask_selectors:
