@@ -438,6 +438,33 @@ def load_config(path: str = "config.yaml") -> dict:
         return yaml.safe_load(f)
 
 
+def fmt_duration(seconds: float) -> str:
+    """Компактно: 42с / 3м 07с / 1ч 02м 03с."""
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}ч {minutes:02d}м {secs:02d}с"
+    if minutes:
+        return f"{minutes}м {secs:02d}с"
+    return f"{secs}с"
+
+
+def terminal_link(path: Path, label: str | None = None) -> str:
+    """
+    Делает путь кликабельным в терминале (OSC 8).
+    VS Code и большинство современных терминалов открывают такую ссылку
+    по Ctrl+Click (в VS Code — прямо в редакторе).
+
+    Если вывод не в терминал (пайп, CI-лог), отдаёт обычный путь.
+    """
+    resolved = path.resolve()
+    text = label or str(resolved)
+    if not sys.stdout.isatty():
+        return text
+    return f"\x1b]8;;{resolved.as_uri()}\x1b\\{text}\x1b]8;;\x1b\\"
+
+
 def url_join(base: str, rel: str) -> str:
     """
     Корректно склеивает базовый URL (возможно, с query string)
@@ -861,13 +888,19 @@ async def check_one(
     viewport: dict,
     cfg: dict,
     outdir: Path,
+    index: int = 1,
+    total: int = 1,
+    elapsed_s: float = 0.0,
 ) -> dict[str, Any]:
     name = slug(rel_url)
     ref_png = outdir / f"{name}__{vp_name}__ref.png"
     cur_png = outdir / f"{name}__{vp_name}__cur.png"
     diff_png = outdir / f"{name}__{vp_name}__diff.png"
 
-    print(f"→ [{vp_name}] {rel_url}")
+    pct = index * 100 / total if total else 100.0
+    started = time.monotonic()
+    print(f"[{index}/{total} · {pct:.0f}% · прошло {fmt_duration(elapsed_s)}] "
+          f"→ [{vp_name}] {rel_url}", flush=True)
 
     freeze = freeze_options(cfg)
     mocks = cfg.get("mocks", {})
@@ -885,7 +918,8 @@ async def check_one(
 
     ratio = diff_images(ref_png, cur_png, diff_png)
     status = "ok" if ratio <= cfg["diff_threshold"] else "diff"
-    print(f"   {'✓' if status == 'ok' else '✗'} diff={ratio:.4%}")
+    print(f"   {'✓' if status == 'ok' else '✗'} diff={ratio:.4%} "
+          f"· {fmt_duration(time.monotonic() - started)}", flush=True)
 
     return {
         "url": rel_url,
@@ -965,15 +999,23 @@ async def main(cfg_path: str = "config.yaml") -> int:
 
     results: list[dict[str, Any]] = []
 
+    total = len(cfg["urls"]) * len(cfg["viewports"])
+    done = 0
+    run_started = time.monotonic()
+
     for rel_url in cfg["urls"]:
         for vp_name, vp in cfg["viewports"].items():
+            done += 1
             try:
                 results.append(
-                    await check_one(rel_url, vp_name, vp, cfg, outdir)
+                    await check_one(rel_url, vp_name, vp, cfg, outdir,
+                                    index=done, total=total,
+                                    elapsed_s=time.monotonic() - run_started)
                 )
             except Exception as e:
-                print(f"   ! FAILED {rel_url} [{vp_name}]: {e}",
-                      file=sys.stderr)
+                print(f"   ! FAILED {rel_url} [{vp_name}] "
+                      f"(прошло {fmt_duration(time.monotonic() - run_started)}): {e}",
+                      file=sys.stderr, flush=True)
                 results.append({
                     "url": rel_url,
                     "viewport": vp_name,
@@ -995,8 +1037,17 @@ async def main(cfg_path: str = "config.yaml") -> int:
     report = outdir / "index.html"
     report.write_text(html, encoding="utf-8")
 
-    print(f"\nОтчёт: {report.resolve()}")
-    print(f"Проверок: {len(results)}, расхождений: {broken}")
+    # подпись — путь относительно cwd: коротко и его же подхватывает
+    # встроенное распознавание ссылок терминала, если OSC 8 не поддержан
+    resolved = report.resolve()
+    try:
+        label = str(resolved.relative_to(Path.cwd()))
+    except ValueError:
+        label = str(resolved)
+
+    print(f"\nОтчёт: {terminal_link(resolved, label)}")
+    print(f"Проверок: {len(results)}/{total}, расхождений: {broken} · "
+          f"за {fmt_duration(time.monotonic() - run_started)}")
     return 0 if broken == 0 else 1
 
 
