@@ -329,12 +329,22 @@ async () => {
 WAIT_MEDIA_JS = r"""
 async (opts) => {
     const perResource = (opts && opts.per_resource_ms) || 30000;
+    const sampleLimit = (opts && opts.sample_limit) || 15;
 
     // true — ресурс успел; false — не успел за отведённое время
     const withTimeout = (promise) => Promise.race([
         promise.then(() => true, () => true),
         new Promise(resolve => setTimeout(() => resolve(false), perResource)),
     ]);
+
+    const short = (url) => {
+        const s = String(url || '');
+        return s.length > 160 ? s.slice(0, 157) + '...' : s;
+    };
+
+    const check = async (kind, url, promise) => ({
+        kind, url: short(url), ok: await withTimeout(promise),
+    });
 
     const isHidden = (el) => {
         try {
@@ -344,8 +354,13 @@ async (opts) => {
     };
 
     const waitImage = (img) => {
-        if (img.complete && img.naturalWidth > 0) {
-            return img.decode ? img.decode() : Promise.resolve();
+        // complete=true → браузер уже закончил с этой картинкой.
+        // naturalWidth=0 при этом означает битый/пустой src: load/error
+        // по ней БОЛЬШЕ НЕ сработают, и ждать её — верный таймаут.
+        if (img.complete) {
+            return (img.naturalWidth > 0 && img.decode)
+                ? img.decode()
+                : Promise.resolve();
         }
         return new Promise(resolve => {
             const finish = () => {
@@ -355,6 +370,8 @@ async (opts) => {
             };
             img.addEventListener('load', finish);
             img.addEventListener('error', finish);
+            // гонка: картинка могла догрузиться между проверкой и подпиской
+            if (img.complete) finish();
         });
     };
 
@@ -373,8 +390,10 @@ async (opts) => {
     /* 1. Картинки --------------------------------------------------- */
     const images = collectImages();
     const waiting = images.filter(img => !isHidden(img) && (img.currentSrc || img.src));
-    const imageResults = await Promise.all(waiting.map(img => withTimeout(waitImage(img))));
-    const pendingImages = imageResults.filter(ok => ok === false).length;
+    const imageChecks = await Promise.all(waiting.map(img =>
+        check('img', img.currentSrc || img.src, waitImage(img))));
+    const pendingImages = imageChecks.filter(c => !c.ok).length;
+    const pendingWaiting = imageChecks.filter(c => !c.ok);
 
     /* 2. CSS-фоны --------------------------------------------------- */
     let bgTotal = 0;
@@ -400,23 +419,43 @@ async (opts) => {
             window.__bgUrls = urls;
         }
         bgTotal = urls.size;
-        const bgResults = await Promise.all(Array.from(urls).map(url =>
-            withTimeout(new Promise(resolve => {
+        const bgChecks = await Promise.all(Array.from(urls).map(url =>
+            check('bg', url, new Promise(resolve => {
                 const probe = new Image();
                 probe.onload = () => resolve();
                 probe.onerror = () => resolve();
                 probe.src = url;
             }))
         ));
-        pendingBackgrounds = bgResults.filter(ok => ok === false).length;
+        pendingBackgrounds = bgChecks.filter(c => !c.ok).length;
+        pendingWaiting.push(...bgChecks.filter(c => !c.ok));
     }
 
     /* 3. Шрифты ----------------------------------------------------- */
     let pendingFonts = 0;
     if (document.fonts) {
         const ok = await withTimeout(document.fonts.ready);
-        if (!ok || document.fonts.status !== 'loaded') pendingFonts = 1;
+        const status = document.fonts.status;
+        if (!ok || status !== 'loaded') {
+            pendingFonts = 1;
+            pendingWaiting.push({ kind: 'font', url: 'document.fonts: ' + status });
+        }
     }
+
+    /* 4. Группируем незагруженное для лога -------------------------- */
+    const grouped = new Map();
+    for (const item of pendingWaiting) {
+        const key = item.kind + '\u0000' + item.url;
+        const entry = grouped.get(key) || { kind: item.kind, url: item.url, count: 0 };
+        entry.count += 1;
+        grouped.set(key, entry);
+    }
+    const pendingSamples = Array.from(grouped.values())
+        .sort((a, b) => b.count - a.count)
+        .slice(0, sampleLimit)
+        .map(e => (e.count > 1
+            ? `${e.kind} ×${e.count}: ${e.url}`
+            : `${e.kind}: ${e.url}`));
 
     return {
         ready_state: document.readyState,
@@ -426,8 +465,25 @@ async (opts) => {
         backgrounds_total: bgTotal,
         pending_backgrounds: pendingBackgrounds,
         pending_fonts: pendingFonts,
+        pending_samples: pendingSamples,
     };
 }
+"""
+
+# STORAGE_SCRIPT — проставляет localStorage ДО скриптов страницы, чтобы
+# приложение сразу увидело нужные флаги (регион, согласия на cookie,
+# отключённые A/B-эксперименты и т.п.). Пишем только в разрешённые
+# origin'ы, чтобы не трогать сторонние iframe.
+STORAGE_SCRIPT = r"""
+(() => {
+    const cfg = __STORAGE__;
+    try {
+        if (cfg.origins.length && !cfg.origins.includes(location.origin)) return;
+        for (const key of Object.keys(cfg.data)) {
+            window.localStorage.setItem(key, cfg.data[key]);
+        }
+    } catch (e) {}   // opaque origin / заблокированное хранилище
+})();
 """
 
 
@@ -558,6 +614,80 @@ def build_guard_script(freeze: dict) -> str:
     return GUARD_SCRIPT.replace("__OPTIONS__", payload)
 
 
+def _storage_value(value: Any) -> str:
+    """localStorage хранит только строки."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(value, ensure_ascii=False)   # dict/list → JSON-строка
+
+
+def _apply_storage_placeholders(text: str, now_ms: int) -> str:
+    """
+    Подставляет текущее время в значение localStorage:
+
+      $now_ms → миллисекунды (как Date.now())
+      $now_s  → секунды
+
+    Работает и в строковом JSON, и в разобранном из YAML объекте. Если
+    токен обёрнут в кавычки ("$now_ms"), кавычки снимаются — в итоговом
+    JSON должно оказаться число, а не строка.
+    """
+    now_s = now_ms // 1000
+    for token, value in (("$now_ms", now_ms), ("$now_s", now_s)):
+        text = text.replace(f'"{token}"', str(value))
+        text = text.replace(token, str(value))
+    return text
+
+
+def storage_options(cfg: dict) -> tuple[dict[str, str], list[str]]:
+    """
+    Разбирает `local_storage` из конфига и определяет, каким origin'ам
+    его проставлять.
+
+    По умолчанию — только origin'ы эталона и стенда (из `reference`
+    и `current`), чтобы не писать localStorage сторонним iframe'ам.
+    Список можно задать явно через `local_storage_origins`.
+    """
+    raw = cfg.get("local_storage") or {}
+    if not isinstance(raw, dict):
+        return {}, []
+
+    now_ms = int(time.time() * 1000)
+    values = {
+        str(k): _apply_storage_placeholders(_storage_value(v), now_ms)
+        for k, v in raw.items()
+    }
+
+    origins = cfg.get("local_storage_origins")
+    if origins is not None:
+        return values, [str(o) for o in origins]
+
+    origins = []
+    for base in (cfg.get("reference"), cfg.get("current")):
+        if not base:
+            continue
+        parts = urlsplit(str(base))
+        origin = f"{parts.scheme}://{parts.netloc}" if parts.netloc else ""
+        if origin and origin not in origins:
+            origins.append(origin)
+    return values, origins
+
+
+def build_storage_script(cfg: dict) -> str:
+    """Скрипт для context.add_init_script() или пустая строка."""
+    values, origins = storage_options(cfg)
+    if not values:
+        return ""
+    payload = json.dumps(
+        {"data": values, "origins": origins}, ensure_ascii=False
+    )
+    return STORAGE_SCRIPT.replace("__STORAGE__", payload)
+
+
 async def strip_existing_listeners(cdp: CDPSession, event_types: list[str]) -> int:
     """
     Снимает уже зарегистрированные слушатели по «шумным» событиям
@@ -582,7 +712,7 @@ async def strip_existing_listeners(cdp: CDPSession, event_types: list[str]) -> i
     return 0
 
 
-async def wait_for_media(page: Page, freeze: dict) -> dict:
+async def wait_for_media(page: Page, freeze: dict, label: str = "") -> dict:
     """
     Ждёт реальной готовности страницы к снимку, а не фиксированную паузу:
     картинки загружены и раскодированы (img.decode), CSS-фоны подтянуты,
@@ -593,11 +723,9 @@ async def wait_for_media(page: Page, freeze: dict) -> dict:
     просто отпускает страницу — снимок важнее ожидания.
     """
     timeout_ms = int(freeze["media_timeout_ms"])
-    opts = {
-        "per_resource_ms": freeze["media_per_resource_ms"],
-        "backgrounds": freeze["wait_for_backgrounds"],
-    }
+    per_resource_ms = int(freeze["media_per_resource_ms"])
     deadline = time.monotonic() + timeout_ms / 1000 if timeout_ms > 0 else None
+    prefix = f"[{label}] " if label else ""
 
     stats: dict[str, Any] = {}
     stable = 0
@@ -607,10 +735,23 @@ async def wait_for_media(page: Page, freeze: dict) -> dict:
 
     while True:
         rounds += 1
+
+        # бюджет на ресурс не может перебивать остаток общего таймаута,
+        # иначе одна итерация легко съедает весь media_timeout_ms
+        budget_ms = per_resource_ms
+        if deadline is not None:
+            left_ms = int((deadline - time.monotonic()) * 1000)
+            budget_ms = min(per_resource_ms, max(left_ms, 1000))
+
+        opts = {
+            "per_resource_ms": budget_ms,
+            "backgrounds": freeze["wait_for_backgrounds"],
+            "sample_limit": 15,
+        }
         try:
             stats = await page.evaluate(WAIT_MEDIA_JS, opts)
         except Exception as e:
-            print(f"  ! wait_media failed: {e}", file=sys.stderr)
+            print(f"  ! {prefix}wait_media failed: {e}", file=sys.stderr)
             return stats
 
         pending = (
@@ -640,8 +781,12 @@ async def wait_for_media(page: Page, freeze: dict) -> dict:
         await page.wait_for_timeout(300)
 
     if timed_out:
-        print(f"  ! wait_media: таймаут {timeout_ms} мс, "
-              f"не готово ресурсов: {pending}", file=sys.stderr)
+        print(f"  ! {prefix}wait_media: таймаут {fmt_duration(timeout_ms / 1000)} — "
+              f"не дождались: img {stats.get('pending_images', 0)}, "
+              f"bg {stats.get('pending_backgrounds', 0)}, "
+              f"font {stats.get('pending_fonts', 0)}", file=sys.stderr)
+        for sample in stats.get("pending_samples", []):
+            print(f"      {sample}", file=sys.stderr)
     else:
         print(f"  · ресурсы готовы ({rounds} итерац.): "
               f"img {stats.get('images_waiting')}/{stats.get('images_total')}, "
@@ -764,6 +909,8 @@ async def take_screenshot(
     settle_ms: int,
     mask_selectors: list[str],
     freeze: dict,
+    side: str = "",
+    storage_script: str = "",
 ) -> None:
     animate = freeze["disable_animations"]
 
@@ -783,6 +930,10 @@ async def take_screenshot(
         # предохранитель ставится ДО скриптов страницы, поэтому он
         # перехватывает вообще все регистрации слушателей
         await context.add_init_script(script=build_guard_script(freeze))
+
+        # localStorage — тоже до скриптов страницы (регион, согласия, флаги A/B)
+        if storage_script:
+            await context.add_init_script(script=storage_script)
 
         page = await context.new_page()
         target = url_join(base_url, rel_url)
@@ -815,7 +966,7 @@ async def take_screenshot(
 
         # ждём, пока все ресурсы действительно прогрузятся и раскодируются
         if freeze["wait_for_media"]:
-            await wait_for_media(page, freeze)
+            await wait_for_media(page, freeze, side)
 
         # settle_ms теперь — именно ДОБАВКА после загрузки ресурсов
         # (отложенные блоки, пересчёт layout), а не основное ожидание
@@ -907,13 +1058,17 @@ async def check_one(
     masks = cfg.get("mask_selectors", [])
     settle_ms = cfg.get("settle_ms", 1500)
 
+    storage_script = build_storage_script(cfg)
+
     await take_screenshot(
         cfg["reference"], rel_url, viewport, ref_png,
-        mocks, settle_ms, masks, freeze,
+        mocks, settle_ms, masks, freeze, side="эталон",
+        storage_script=storage_script,
     )
     await take_screenshot(
         cfg["current"], rel_url, viewport, cur_png,
-        mocks, settle_ms, masks, freeze,
+        mocks, settle_ms, masks, freeze, side="стенд",
+        storage_script=storage_script,
     )
 
     ratio = diff_images(ref_png, cur_png, diff_png)
@@ -996,6 +1151,11 @@ async def main(cfg_path: str = "config.yaml") -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     print(f"Заморозка: {freeze_summary(freeze)}")
+
+    storage, storage_origins = storage_options(cfg)
+    if storage:
+        print(f"localStorage: {', '.join(storage)} → "
+              f"{', '.join(storage_origins) or 'все origin'}")
 
     results: list[dict[str, Any]] = []
 

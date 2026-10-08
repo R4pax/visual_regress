@@ -1,23 +1,23 @@
-reference: "https://sberdevices.ift.app.sberdevices.ru/?pr_auth_proxy_token=ce26d7350a6d2787bdc7e0b0defd1326"
-current: "https://pr-1557-sberdevices.dev.app.sberdevices.ru/?pr_auth_proxy_token=6afb833dcb3fe6beed824ac742c8fc21"
+reference: "https://sberdevices.ru/"
+current: "https://sberdevices.pre-prom.app.sberdevices.ru/"
 
 urls:
   - "/"
-  - "/about/"
-  - "/about-sberboom-2/"
+  # - "/about/"
+  # - "/about-sberboom-2/"
   - "/b2b/"
-  - "/b2b/shop/"
-  - "/b2b/smarthome/education/"
-  - "/b2b/smarthome/education/reserve/"
-  - "/claim/"
-  - "/contacts/"
-  - "/event/"
+  # - "/b2b/shop/"
+  # - "/b2b/smarthome/education/"
+  # - "/b2b/smarthome/education/reserve/"
+  # - "/claim/"
+  # - "/contacts/"
+  # - "/event/"
   - "/farfield/"
   - "/gigachat/"
-  - "/greenday/"
-  - "/offline_store/"
-  - "/os/"
-  - "/promo/"
+  # - "/greenday/"
+  # - "/offline_store/"
+  # - "/os/"
+  # - "/promo/"
   - "/ring/"
   - "/ring/size/"
   - "/ring/start/"
@@ -42,13 +42,13 @@ urls:
   - "/smarthome/security/"
   - "/smarthome/zigbee/"
   - "/smarthotel/"
-  - "/special-offers/"
-  - "/survey/"
+  # - "/special-offers/"
+  # - "/survey/"
   - "/tv8000/"
-  - "/tvsber/"
+  # - "/tvsber/"
 
 viewports:
-  wide: { width: 2080, height: 1000 }
+  # wide: { width: 2080, height: 1000 }
   desktop: { width: 1440, height: 900 }
   mobile: { width: 360, height: 800 }
 
@@ -69,10 +69,10 @@ settle_ms: 1500
 wait_for_media: true
 
 # Общий бюджет ожидания на одну страницу, мс. 0 — без ограничения
-media_timeout_ms: 180000
+media_timeout_ms: 15000
 
 # Потолок ожидания на один ресурс, мс (чтобы не зависнуть на битой картинке)
-media_per_resource_ms: 30000
+media_per_resource_ms: 15000
 
 # Догружать CSS-фоны (background-image) — частая причина «полузагруженных»
 # картинок в снимке: элемент уже на месте, а фон ещё едет
@@ -123,6 +123,36 @@ disable_timers: false
 # (CDP Emulation.setScriptExecutionDisabled). Максимальная детерминированность;
 # при ошибке скриншота скрипт сам повторит попытку с включённым JS
 kill_scripts_before_shot: true
+
+# ----------------------------------------------------------------------------
+# localStorage: проставляется сайтам ДО загрузки скриптов страницы
+# ----------------------------------------------------------------------------
+
+# Часто нужно, чтобы убрать баннер согласия, зафиксировать регион или
+# погасить A/B-эксперименты — тогда состояние страницы детерминировано.
+# Значения пишутся как строки (true/false — строчными буквами,
+# объекты/массивы — JSON-строкой).
+#
+# Проставляется и эталону, и стенду: смысл в том, чтобы состояние совпало.
+#
+# В значениях работает подстановка текущего времени:
+#   $now_ms — миллисекунды (как Date.now()), $now_s — секунды.
+# Значение считается один раз на проверяемую страницу.
+#
+# local_storage:
+#   cookie_accepted: "1"
+#   region: "moscow"
+#   ab_test_disabled: true
+#   user_settings: { theme: "dark", lang: "ru" }
+
+local_storage:
+  # lastFailLogin — текущая метка времени на момент снимка
+  __auto_auth: '{"lastLogout":0,"lastFailLogin":$now_ms,"lastCookiesUpdate":0}'
+
+# По умолчанию пишем только в origin'ы reference/current, чтобы не трогать
+# сторонние iframe. Список можно задать явно:
+# local_storage_origins:
+#   - "https://sberdevices.ift.app.sberdevices.ru"
 
 # Селекторы, которые вырезаем из DOM перед снимком (динамика)
 mask_selectors:
