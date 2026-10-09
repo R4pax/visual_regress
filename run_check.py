@@ -8,10 +8,12 @@ Visual regression checker.
 """
 
 import asyncio
+import ipaddress
 import json
 import sys
 import time
 import datetime as dt
+from collections import Counter
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit, urljoin
@@ -321,6 +323,22 @@ async () => {
     });
 }
 """
+
+# Типы запросов, которые рубим у чужих доменов. `script` — это GTM,
+# метрики, чаты, пиксели рекламы; `subdocument` — их же iframe'ы
+# (Playwright отдаёт их как `document`, отличаем по родительскому фрейму).
+# Стили/картинки/шрифты НЕ трогаем: без них поедет вёрстка и появятся
+# ложные расхождения.
+DEFAULT_BLOCKED_RESOURCE_TYPES = ["script", "subdocument"]
+
+# Двухуровневые публичные суффиксы, которые встречаются чаще всего:
+# чтобы cdn.client.co.uk не приняли за "co.uk".
+MULTI_LABEL_SUFFIXES = {
+    "co.uk", "org.uk", "com.ru", "org.ru", "net.ru", "msk.ru", "spb.ru",
+    "com.au", "co.jp", "co.kr", "com.br", "co.com", "com.tr",
+    "github.io", "pages.dev", "vercel.app", "netlify.app", "herokuapp.com",
+    "appspot.com", "cloudfront.net", "azurewebsites.net",
+}
 
 # WAIT_MEDIA_JS — проверка реальной готовности ресурсов к отрисовке.
 # `img.complete === true` НЕ значит, что картинка уже раскодирована и попадёт
@@ -688,6 +706,136 @@ def build_storage_script(cfg: dict) -> str:
     return STORAGE_SCRIPT.replace("__STORAGE__", payload)
 
 
+def _registrable_domain(host: str) -> str:
+    """
+    Грубый eTLD+1: googletagmanager.com, sberdevices.ru, localhost.
+    Нужен, чтобы cdn.sberdevices.ru и pr-1.dev.sberdevices.ru считались
+    «своими» для сайта на sberdevices.ru.
+
+    IP-адреса возвращаются как есть: 127.0.0.1 — это не «домен 0.1».
+    """
+    host = (host or "").lower().strip(".")
+    if not host:
+        return ""
+    try:
+        ipaddress.ip_address(host)
+        return host
+    except ValueError:
+        pass
+
+    labels = host.split(".")
+    if len(labels) <= 2:
+        return host
+    last_two = ".".join(labels[-2:])
+    if last_two in MULTI_LABEL_SUFFIXES and len(labels) >= 3:
+        return ".".join(labels[-3:])
+    return last_two
+
+
+def _host_of(value: str) -> str:
+    """Принимает и URL, и просто хост."""
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if "//" in text:
+        return (urlsplit(text).hostname or "").lower()
+    return text.lower().strip("/")
+
+
+def third_party_options(cfg: dict) -> dict:
+    """
+    Настройки блокировки сторонних запросов.
+
+    Своими считаются домены из `reference`/`current` (по eTLD+1) —
+    то есть сам сайт и его поддомены/CDN. Всё остальное для выбранных
+    типов ресурсов не загружается: без GTM/метрик/чатов снимок
+    становится заметно стабильнее, и в кадр не лезут чужие iframe'ы.
+    """
+    raw = cfg.get("block_third_party")
+    if isinstance(raw, dict):
+        enabled = bool(raw.get("enabled", True))
+        types = raw.get("resource_types") or DEFAULT_BLOCKED_RESOURCE_TYPES
+        allow = raw.get("allow") or []
+        log = bool(raw.get("log", True))
+    else:
+        enabled = True if raw is None else bool(raw)
+        types = DEFAULT_BLOCKED_RESOURCE_TYPES
+        allow = []
+        log = True
+
+    domains: set[str] = set()
+    for base in (cfg.get("reference"), cfg.get("current")):
+        host = _host_of(base)
+        if host:
+            domains.add(_registrable_domain(host))
+
+    allow_hosts = {h for h in (_host_of(a) for a in allow) if h}
+
+    return {
+        "enabled": enabled,
+        "resource_types": {str(t).lower() for t in types},
+        "allowed_domains": domains,
+        "allow_hosts": allow_hosts,
+        "log": log,
+    }
+
+
+async def apply_third_party_block(context: BrowserContext, opts: dict) -> Counter:
+    """
+    Рубит запросы к чужим доменам для выбранных типов ресурсов.
+    Возвращает счётчик заблокированных хостов (может дописываться по ходу).
+
+    Регистрировать надо РАНЬШЕ моков: Playwright проверяет обработчики
+    от последнего к первому, поэтому моки должны иметь приоритет.
+    """
+    blocked: Counter = Counter()
+    if not opts["enabled"]:
+        return blocked
+
+    types = opts["resource_types"]
+    allowed = opts["allowed_domains"]
+    extra = opts["allow_hosts"]
+
+    async def handler(route: Route) -> None:
+        request = route.request
+        kind = request.resource_type
+
+        # iframe Playwright тоже называет `document` — отличаем по фрейму
+        if kind == "document":
+            try:
+                frame = request.frame
+            except Exception:
+                frame = None
+            if frame is None or frame.parent_frame is None:
+                await route.continue_()      # главный документ не трогаем
+                return
+            kind = "subdocument"
+
+        if kind in types:
+            host = (urlsplit(request.url).hostname or "").lower()
+            if host and host not in extra and _registrable_domain(host) not in allowed:
+                blocked[host] += 1
+                await route.abort()
+                return
+
+        await route.continue_()
+
+    await context.route("**/*", handler)
+    return blocked
+
+
+def format_blocked(blocked: Counter, limit: int = 5) -> str:
+    """«googletagmanager.com ×2, mc.yandex.ru» — для лога."""
+    if not blocked:
+        return ""
+    parts = []
+    for host, count in blocked.most_common(limit):
+        parts.append(f"{host} ×{count}" if count > 1 else host)
+    if len(blocked) > limit:
+        parts.append(f"и ещё {len(blocked) - limit}")
+    return ", ".join(parts)
+
+
 async def strip_existing_listeners(cdp: CDPSession, event_types: list[str]) -> int:
     """
     Снимает уже зарегистрированные слушатели по «шумным» событиям
@@ -911,8 +1059,10 @@ async def take_screenshot(
     freeze: dict,
     side: str = "",
     storage_script: str = "",
+    third_party: dict | None = None,
 ) -> None:
     animate = freeze["disable_animations"]
+    prefix_log = f"[{side}] " if side else ""
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -924,6 +1074,10 @@ async def take_screenshot(
                 "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/124 Safari/537.36"
             ),
+        )
+        # чужие скрипты/iframe'ы отсекаем ДО моков: у моков приоритет
+        blocked = await apply_third_party_block(
+            context, third_party or {"enabled": False}
         )
         await apply_mocks(context, mocks)
 
@@ -1028,6 +1182,10 @@ async def take_screenshot(
                     pass
             await page.screenshot(path=str(out_path), full_page=True)
 
+        if third_party and third_party.get("log") and blocked:
+            print(f"  · {prefix_log}заблокировано сторонних запросов: "
+                  f"{format_blocked(blocked)}")
+
         await browser.close()
 
 
@@ -1059,16 +1217,17 @@ async def check_one(
     settle_ms = cfg.get("settle_ms", 1500)
 
     storage_script = build_storage_script(cfg)
+    third_party = third_party_options(cfg)
 
     await take_screenshot(
         cfg["reference"], rel_url, viewport, ref_png,
         mocks, settle_ms, masks, freeze, side="эталон",
-        storage_script=storage_script,
+        storage_script=storage_script, third_party=third_party,
     )
     await take_screenshot(
         cfg["current"], rel_url, viewport, cur_png,
         mocks, settle_ms, masks, freeze, side="стенд",
-        storage_script=storage_script,
+        storage_script=storage_script, third_party=third_party,
     )
 
     ratio = diff_images(ref_png, cur_png, diff_png)
@@ -1156,6 +1315,11 @@ async def main(cfg_path: str = "config.yaml") -> int:
     if storage:
         print(f"localStorage: {', '.join(storage)} → "
               f"{', '.join(storage_origins) or 'все origin'}")
+
+    third_party = third_party_options(cfg)
+    if third_party["enabled"]:
+        print(f"Сторонние: блокирую {'/'.join(sorted(third_party['resource_types']))} "
+              f"вне {', '.join(sorted(third_party['allowed_domains'])) or '—'}")
 
     results: list[dict[str, Any]] = []
 

@@ -2,10 +2,10 @@ reference: "https://sberdevices.ru/"
 current: "https://sberdevices.pre-prom.app.sberdevices.ru/"
 
 urls:
-  - "/"
+  # - "/"
   # - "/about/"
   # - "/about-sberboom-2/"
-  - "/b2b/"
+  # - "/b2b/"
   # - "/b2b/shop/"
   # - "/b2b/smarthome/education/"
   # - "/b2b/smarthome/education/reserve/"
@@ -13,42 +13,42 @@ urls:
   # - "/contacts/"
   # - "/event/"
   - "/farfield/"
-  - "/gigachat/"
+  # - "/gigachat/"
   # - "/greenday/"
   # - "/offline_store/"
   # - "/os/"
   # - "/promo/"
   - "/ring/"
-  - "/ring/size/"
-  - "/ring/start/"
-  - "/sberboom/"
+  # - "/ring/size/"
+  # - "/ring/start/"
+  # - "/sberboom/"
   - "/sberboom-2/"
-  - "/sberboom-home/"
-  - "/sberboom-home-love/"
+  # - "/sberboom-home/"
+  # - "/sberboom-home-love/"
   - "/sberboom-micro/"
-  - "/sberboom-mini/"
+  # - "/sberboom-mini/"
   - "/sberboom-mini-prostokvashino/"
-  - "/sberboom-mini2/"
-  - "/sberbox2/"
+  # - "/sberboom-mini2/"
+  # - "/sberbox2/"
   - "/sberboxmax/"
   - "/sberboxmax_gaming/"
-  - "/sberboxtop/"
-  - "/sberkot/"
-  - "/shop/"
+  # - "/sberboxtop/"
+  # - "/sberkot/"
+  # - "/shop/"
   - "/smarthome/"
-  - "/smarthome/atlasdesignsmart/"
-  - "/smarthome/climate/"
-  - "/smarthome/lighting/"
-  - "/smarthome/security/"
-  - "/smarthome/zigbee/"
-  - "/smarthotel/"
+  # - "/smarthome/atlasdesignsmart/"
+  # - "/smarthome/climate/"
+  # - "/smarthome/lighting/"
+  # - "/smarthome/security/"
+  # - "/smarthome/zigbee/"
+  # - "/smarthotel/"
   # - "/special-offers/"
   # - "/survey/"
   - "/tv8000/"
   # - "/tvsber/"
 
 viewports:
-  # wide: { width: 2080, height: 1000 }
+  wide: { width: 2080, height: 1000 }
   desktop: { width: 1440, height: 900 }
   mobile: { width: 360, height: 800 }
 
@@ -153,6 +153,26 @@ local_storage:
 # сторонние iframe. Список можно задать явно:
 # local_storage_origins:
 #   - "https://sberdevices.ift.app.sberdevices.ru"
+
+# ----------------------------------------------------------------------------
+# Сторонние скрипты и iframe'ы (GTM, метрики, чаты, A/B-сервисы)
+# ----------------------------------------------------------------------------
+
+# Чужими считаются домены вне eTLD+1 от reference/current: сам сайт и его
+# поддомены (cdn., static., pr-*.dev.) остаются разрешёнными. Стили,
+# картинки и шрифты не трогаем — иначе поедет вёрстка и появятся ложные
+# расхождения. Скрипты сторонних домены не грузятся вовсе, поэтому
+# GTM не успевает вставить свой <iframe> в разметку.
+block_third_party:
+  enabled: true
+  # script — сторонние скрипты, subdocument — их же iframe'ы
+  # (можно добавить xhr, fetch, eventsource — резать ещё и их запросы)
+  resource_types: [script, subdocument]
+  # Исключения, если нужное отдаётся с чужого домена:
+  # allow:
+  #   - "cdn.jsdelivr.net"
+  #   - "fonts.gstatic.com"
+  log: true
 
 # Селекторы, которые вырезаем из DOM перед снимком (динамика)
 mask_selectors:
