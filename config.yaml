@@ -18,16 +18,16 @@ urls:
   # - "/offline_store/"
   # - "/os/"
   # - "/promo/"
-  - "/ring/"
+  # - "/ring/"
   # - "/ring/size/"
   # - "/ring/start/"
   # - "/sberboom/"
   - "/sberboom-2/"
   # - "/sberboom-home/"
   # - "/sberboom-home-love/"
-  - "/sberboom-micro/"
+  # - "/sberboom-micro/"
   # - "/sberboom-mini/"
-  - "/sberboom-mini-prostokvashino/"
+  # - "/sberboom-mini-prostokvashino/"
   # - "/sberboom-mini2/"
   # - "/sberbox2/"
   - "/sberboxmax/"
@@ -35,6 +35,14 @@ urls:
   # - "/sberboxtop/"
   # - "/sberkot/"
   # - "/shop/"
+  # - "/shop/category/promo/"
+  # - "/shop/category/installment/"
+  # - "/shop/category/tv/"
+  # - "/shop/category/speakers/"
+  # - "/shop/category/tvbox/"
+  # - "/shop/category/ring/"
+  # - "/shop/category/smarthome/"
+  # - "/shop/product/sberboom_2_0_gray/"
   - "/smarthome/"
   # - "/smarthome/atlasdesignsmart/"
   # - "/smarthome/climate/"
@@ -77,6 +85,26 @@ media_per_resource_ms: 15000
 # Догружать CSS-фоны (background-image) — частая причина «полузагруженных»
 # картинок в снимке: элемент уже на месте, а фон ещё едет
 wait_for_backgrounds: true
+
+# Не ждать повторно ресурсы, которые уже не догрузились на прошлых
+# страницах: контекст браузера создаётся заново, кэша нет, поэтому
+# «тормозит один раз» почти всегда = «тормозит всегда». Иначе прогон
+# из сотен страниц не доходит до конца из-за одних и тех же картинок.
+# Все такие URL выводятся одной сводкой в конце прогона.
+media_skip_known_slow: true
+
+# ----------------------------------------------------------------------------
+# Навигация
+# ----------------------------------------------------------------------------
+
+# До чего ждать навигацию. `load` ждать нельзя: висящая картинка держит
+# это событие до самого таймаута (60 с на страницу). Готовность ресурсов
+# мы и так измеряем сами — в wait_for_media.
+goto_wait_until: domcontentloaded
+
+# Сколько ждать затишья сети после навигации, мс. 0 — не ждать вовсе.
+# Большое значение тоже бессмысленно: пока висит ресурс, затишья не будет.
+networkidle_ms: 2000
 
 # Отключать анимации перед снимком
 # (CSS, Web Animations, видео, GIF/APNG — см. FREEZE_CSS/FREEZE_JS)

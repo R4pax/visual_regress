@@ -348,6 +348,9 @@ WAIT_MEDIA_JS = r"""
 async (opts) => {
     const perResource = (opts && opts.per_resource_ms) || 30000;
     const sampleLimit = (opts && opts.sample_limit) || 15;
+    // URL, которые уже не догрузились на других страницах — не ждём повторно:
+    // контекст браузера каждый раз новый, кэша нет, так что смысла нет
+    const skip = new Set((opts && opts.skip_urls) || []);
 
     // true — ресурс успел; false — не успел за отведённое время
     const withTimeout = (promise) => Promise.race([
@@ -361,7 +364,8 @@ async (opts) => {
     };
 
     const check = async (kind, url, promise) => ({
-        kind, url: short(url), ok: await withTimeout(promise),
+        kind, url: String(url || ''), short: short(url),
+        ok: await withTimeout(promise),
     });
 
     const isHidden = (el) => {
@@ -407,7 +411,8 @@ async (opts) => {
 
     /* 1. Картинки --------------------------------------------------- */
     const images = collectImages();
-    const waiting = images.filter(img => !isHidden(img) && (img.currentSrc || img.src));
+    const visible = images.filter(img => !isHidden(img) && (img.currentSrc || img.src));
+    const waiting = visible.filter(img => !skip.has(img.currentSrc || img.src));
     const imageChecks = await Promise.all(waiting.map(img =>
         check('img', img.currentSrc || img.src, waitImage(img))));
     const pendingImages = imageChecks.filter(c => !c.ok).length;
@@ -436,8 +441,9 @@ async (opts) => {
             }
             window.__bgUrls = urls;
         }
-        bgTotal = urls.size;
-        const bgChecks = await Promise.all(Array.from(urls).map(url =>
+        const bgUrls = Array.from(urls).filter(u => !skip.has(u));
+        bgTotal = bgUrls.length;
+        const bgChecks = await Promise.all(bgUrls.map(url =>
             check('bg', url, new Promise(resolve => {
                 const probe = new Image();
                 probe.onload = () => resolve();
@@ -472,18 +478,23 @@ async (opts) => {
         .sort((a, b) => b.count - a.count)
         .slice(0, sampleLimit)
         .map(e => (e.count > 1
-            ? `${e.kind} ×${e.count}: ${e.url}`
-            : `${e.kind}: ${e.url}`));
+            ? `${e.kind} ×${e.count}: ${e.short}`
+            : `${e.kind}: ${e.short}`));
+
+    // все URL насквозь: wait_for_media() запомнит их, чтобы не ждать повторно
+    const pendingUrls = pendingWaiting.map(i => i.url).slice(0, 300);
 
     return {
         ready_state: document.readyState,
         images_total: images.length,
         images_waiting: waiting.length,
+        images_skipped: visible.length - waiting.length,
         pending_images: pendingImages,
         backgrounds_total: bgTotal,
         pending_backgrounds: pendingBackgrounds,
         pending_fonts: pendingFonts,
         pending_samples: pendingSamples,
+        pending_urls: pendingUrls,
     };
 }
 """
@@ -573,12 +584,23 @@ def freeze_options(cfg: dict) -> dict:
     if arm not in ("start", "freeze"):
         arm = "freeze"
 
+    # ждать `load` нельзя: висящая картинка держит его до самого таймаута.
+    # Готовность ресурсов мы и так проверяем сами — в wait_for_media()
+    goto_wait = str(cfg.get("goto_wait_until", "domcontentloaded")).lower()
+    if goto_wait not in ("domcontentloaded", "load"):
+        goto_wait = "domcontentloaded"
+
     return {
         # --- ожидание реальной загрузки ресурсов ----------------------»
         "wait_for_media": bool(cfg.get("wait_for_media", True)),
         "media_timeout_ms": int(cfg.get("media_timeout_ms", 180_000)),
         "media_per_resource_ms": int(cfg.get("media_per_resource_ms", 30_000)),
         "wait_for_backgrounds": bool(cfg.get("wait_for_backgrounds", True)),
+        # не ждать ресурсы, которые уже не догрузились на прошлых страницах
+        "skip_known_slow": bool(cfg.get("media_skip_known_slow", True)),
+        # до чего ждать готовности навигации и сколько ждать затишья сети
+        "goto_wait_until": goto_wait,
+        "networkidle_ms": int(cfg.get("networkidle_ms", 2000)),
         # --- заморозка ------------------------------------------------
         # существующее поведение
         "disable_animations": bool(cfg.get("disable_animations", True)),
@@ -860,7 +882,56 @@ async def strip_existing_listeners(cdp: CDPSession, event_types: list[str]) -> i
     return 0
 
 
-async def wait_for_media(page: Page, freeze: dict, label: str = "") -> dict:
+class MediaWatch:
+    """
+    Состояние ожидания ресурсов на весь прогон.
+
+    Запоминает URL, которые не догрузились, чтобы не ждать их снова
+    на каждой следующей странице: контекст браузера создаётся каждый раз
+    заново, кэша между снимками нет, поэтому «тормозит один раз» почти
+    всегда означает «будет тормозить всегда». Иначе прогон из сотен
+    страниц не доходит до конца из-за одних и тех же картинок.
+    """
+
+    def __init__(self, remember: bool = True) -> None:
+        self.remember = remember
+        self._slow: dict[str, set[str]] = {}
+        self.pending: Counter = Counter()   # (side, url) -> сколько раз
+        self.hosts: Counter = Counter()
+
+    def skip_for(self, side: str) -> set[str]:
+        return self._slow.setdefault(side, set()) if self.remember else set()
+
+    def add_pending(self, side: str, urls: list[str]) -> None:
+        for url in urls or []:
+            if not url:
+                continue
+            self.pending[(side, url)] += 1
+            self.hosts[urlsplit(url).hostname or "?"] += 1
+            if self.remember:
+                self.skip_for(side).add(url)
+
+    def report(self, limit: int = 10) -> None:
+        """Сводка по всему прогону — чтобы детали не тонули в логе."""
+        if not self.pending:
+            return
+        hosts = ", ".join(f"{h} ×{n}" for h, n in self.hosts.most_common(6))
+        print(f"\nНе догрузилось за прогон: {len(self.pending)} ресурсов ({hosts})")
+        for (side, url), count in self.pending.most_common(limit):
+            print(f"   ×{count:<4} [{side}] {url}")
+        if len(self.pending) > limit:
+            print(f"   … и ещё {len(self.pending) - limit}")
+        if self.remember:
+            print("   (эти URL больше не ждём на следующих страницах; "
+                  "media_skip_known_slow: false — ждать всегда)")
+
+
+async def wait_for_media(
+    page: Page,
+    freeze: dict,
+    label: str = "",
+    media: MediaWatch | None = None,
+) -> dict:
     """
     Ждёт реальной готовности страницы к снимку, а не фиксированную паузу:
     картинки загружены и раскодированы (img.decode), CSS-фоны подтянуты,
@@ -874,6 +945,7 @@ async def wait_for_media(page: Page, freeze: dict, label: str = "") -> dict:
     per_resource_ms = int(freeze["media_per_resource_ms"])
     deadline = time.monotonic() + timeout_ms / 1000 if timeout_ms > 0 else None
     prefix = f"[{label}] " if label else ""
+    skip_urls = sorted(media.skip_for(label)) if media else []
 
     stats: dict[str, Any] = {}
     stable = 0
@@ -895,6 +967,7 @@ async def wait_for_media(page: Page, freeze: dict, label: str = "") -> dict:
             "per_resource_ms": budget_ms,
             "backgrounds": freeze["wait_for_backgrounds"],
             "sample_limit": 15,
+            "skip_urls": skip_urls,
         }
         try:
             stats = await page.evaluate(WAIT_MEDIA_JS, opts)
@@ -929,16 +1002,22 @@ async def wait_for_media(page: Page, freeze: dict, label: str = "") -> dict:
         await page.wait_for_timeout(300)
 
     if timed_out:
-        print(f"  ! {prefix}wait_media: таймаут {fmt_duration(timeout_ms / 1000)} — "
-              f"не дождались: img {stats.get('pending_images', 0)}, "
+        pending_urls = stats.get("pending_urls", []) or []
+        hosts = Counter(urlsplit(u).hostname or "?" for u in pending_urls)
+        top = ", ".join(f"{h} ×{n}" for h, n in hosts.most_common(3))
+        print(f"  ! {prefix}не дождались за {fmt_duration(timeout_ms / 1000)}: "
+              f"img {stats.get('pending_images', 0)}, "
               f"bg {stats.get('pending_backgrounds', 0)}, "
-              f"font {stats.get('pending_fonts', 0)}", file=sys.stderr)
-        for sample in stats.get("pending_samples", []):
-            print(f"      {sample}", file=sys.stderr)
+              f"font {stats.get('pending_fonts', 0)}"
+              + (f" — {top}" if top else ""), file=sys.stderr, flush=True)
+        if media:
+            media.add_pending(label, pending_urls)
     else:
-        print(f"  · ресурсы готовы ({rounds} итерац.): "
+        skipped = int(stats.get("images_skipped", 0))
+        extra = f", пропущено заведомо тормозящих: {skipped}" if skipped else ""
+        print(f"  · {prefix}ресурсы готовы ({rounds} итерац.): "
               f"img {stats.get('images_waiting')}/{stats.get('images_total')}, "
-              f"фонов {stats.get('backgrounds_total', 0)}")
+              f"фонов {stats.get('backgrounds_total', 0)}{extra}")
 
     return stats
 
@@ -1060,6 +1139,7 @@ async def take_screenshot(
     side: str = "",
     storage_script: str = "",
     third_party: dict | None = None,
+    media: MediaWatch | None = None,
 ) -> None:
     animate = freeze["disable_animations"]
     prefix_log = f"[{side}] " if side else ""
@@ -1100,14 +1180,20 @@ async def take_screenshot(
                 print(f"  ! cdp session failed: {e}", file=sys.stderr)
 
         try:
-            await page.goto(target, wait_until="load", timeout=60_000)
+            await page.goto(target, wait_until=freeze["goto_wait_until"],
+                            timeout=60_000)
         except Exception as e:
             print(f"  ! goto failed {target}: {e}", file=sys.stderr)
 
-        try:
-            await page.wait_for_load_state("networkidle", timeout=10_000)
-        except Exception:
-            pass
+        # затишье сети — с коротким таймаутом: висящий ресурс не должен
+        # задерживать нас, готовность ресурсов проверит wait_for_media()
+        if freeze["networkidle_ms"] > 0:
+            try:
+                await page.wait_for_load_state(
+                    "networkidle", timeout=freeze["networkidle_ms"]
+                )
+            except Exception:
+                pass
 
         # первая заморозка — до прогрева (стабилизирует анимации и маски)
         await freeze_page(page, mask_selectors, animate)
@@ -1120,7 +1206,7 @@ async def take_screenshot(
 
         # ждём, пока все ресурсы действительно прогрузятся и раскодируются
         if freeze["wait_for_media"]:
-            await wait_for_media(page, freeze, side)
+            await wait_for_media(page, freeze, side, media)
 
         # settle_ms теперь — именно ДОБАВКА после загрузки ресурсов
         # (отложенные блоки, пересчёт layout), а не основное ожидание
@@ -1200,6 +1286,7 @@ async def check_one(
     index: int = 1,
     total: int = 1,
     elapsed_s: float = 0.0,
+    media: MediaWatch | None = None,
 ) -> dict[str, Any]:
     name = slug(rel_url)
     ref_png = outdir / f"{name}__{vp_name}__ref.png"
@@ -1222,12 +1309,12 @@ async def check_one(
     await take_screenshot(
         cfg["reference"], rel_url, viewport, ref_png,
         mocks, settle_ms, masks, freeze, side="эталон",
-        storage_script=storage_script, third_party=third_party,
+        storage_script=storage_script, third_party=third_party, media=media,
     )
     await take_screenshot(
         cfg["current"], rel_url, viewport, cur_png,
         mocks, settle_ms, masks, freeze, side="стенд",
-        storage_script=storage_script, third_party=third_party,
+        storage_script=storage_script, third_party=third_party, media=media,
     )
 
     ratio = diff_images(ref_png, cur_png, diff_png)
@@ -1322,33 +1409,42 @@ async def main(cfg_path: str = "config.yaml") -> int:
               f"вне {', '.join(sorted(third_party['allowed_domains'])) or '—'}")
 
     results: list[dict[str, Any]] = []
+    media = MediaWatch(remember=freeze["skip_known_slow"])
 
     total = len(cfg["urls"]) * len(cfg["viewports"])
     done = 0
     run_started = time.monotonic()
+    interrupted = False
 
-    for rel_url in cfg["urls"]:
-        for vp_name, vp in cfg["viewports"].items():
-            done += 1
-            try:
-                results.append(
-                    await check_one(rel_url, vp_name, vp, cfg, outdir,
-                                    index=done, total=total,
-                                    elapsed_s=time.monotonic() - run_started)
-                )
-            except Exception as e:
-                print(f"   ! FAILED {rel_url} [{vp_name}] "
-                      f"(прошло {fmt_duration(time.monotonic() - run_started)}): {e}",
-                      file=sys.stderr, flush=True)
-                results.append({
-                    "url": rel_url,
-                    "viewport": vp_name,
-                    "diff_ratio": 1.0,
-                    "status": "diff",
-                    "ref": "",
-                    "cur": "",
-                    "diff": "",
-                })
+    try:
+        for rel_url in cfg["urls"]:
+            for vp_name, vp in cfg["viewports"].items():
+                done += 1
+                try:
+                    results.append(
+                        await check_one(rel_url, vp_name, vp, cfg, outdir,
+                                        index=done, total=total,
+                                        elapsed_s=time.monotonic() - run_started,
+                                        media=media)
+                    )
+                except Exception as e:
+                    print(f"   ! FAILED {rel_url} [{vp_name}] "
+                          f"(прошло {fmt_duration(time.monotonic() - run_started)}): {e}",
+                          file=sys.stderr, flush=True)
+                    results.append({
+                        "url": rel_url,
+                        "viewport": vp_name,
+                        "diff_ratio": 1.0,
+                        "status": "diff",
+                        "ref": "",
+                        "cur": "",
+                        "diff": "",
+                    })
+    except (KeyboardInterrupt, asyncio.CancelledError):
+        # Ctrl+C: отчёт по уже сделанным проверкам всё равно собираем
+        interrupted = True
+        print(f"\n! Прервано на {done}/{total} — собираю отчёт "
+              f"по готовым проверкам", file=sys.stderr, flush=True)
 
     broken = sum(1 for r in results if r["status"] != "ok")
     html = Template(REPORT_TEMPLATE).render(
@@ -1369,9 +1465,12 @@ async def main(cfg_path: str = "config.yaml") -> int:
     except ValueError:
         label = str(resolved)
 
+    media.report()
+
     print(f"\nОтчёт: {terminal_link(resolved, label)}")
     print(f"Проверок: {len(results)}/{total}, расхождений: {broken} · "
-          f"за {fmt_duration(time.monotonic() - run_started)}")
+          f"за {fmt_duration(time.monotonic() - run_started)}"
+          + (" · прогон прерван" if interrupted else ""))
     return 0 if broken == 0 else 1
 
 
